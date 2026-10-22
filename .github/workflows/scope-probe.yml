@@ -1,0 +1,87 @@
+name: AzureForge scope probe
+run-name: "Scope probe ${{ inputs.correlation_id }}"
+on:
+  workflow_dispatch:
+    inputs:
+      correlation_id:
+        description: "Set by the AzureForge acceptance script"
+        required: true
+        type: string
+permissions:
+  contents: read
+# Each job runs in one protected environment, signs in with that environment's identity through
+# GitHub OIDC, and proves both what it may do and what it must be refused. Expected refusals must
+# carry the specific Azure denial code; any other failure fails the job.
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    environment: production-plan
+    permissions: { contents: read, id-token: write }
+    steps:
+      - uses: azure/login@7184910d9eb2b1c5e48f7073824a90609bb9b6d6 # v2
+        with: { client-id: "${{ vars.AZURE_CLIENT_ID }}", tenant-id: "${{ vars.AZURE_TENANT_ID }}", subscription-id: "${{ vars.AZURE_SUBSCRIPTION_ID }}" }
+      - name: Plan identity stays within Reader plus its state container
+        env: { APP: "${{ vars.APP_GROUP }}", OUTSIDE: "${{ vars.OUTSIDE_GROUP }}", ACCOUNT: "${{ vars.STATE_ACCOUNT }}", RUN: "${{ github.run_id }}" }
+        run: |
+          set -u
+          denied() { out=$("${@:2}" 2>&1) && { echo "UNEXPECTED SUCCESS: $1"; exit 1; }; echo "$out" | grep -q "$1" || { echo "Not the expected denial ($1): $out"; exit 1; }; echo "DENIED as expected ($1)"; }
+          az group show -n "$APP" -o none && echo "PASS: reads the application group"
+          denied AuthorizationFailed az identity create -g "$APP" -n "plan-probe-$RUN"
+          denied AuthorizationFailed az group show -n "$OUTSIDE"
+          echo "plan-$RUN" > probe.txt
+          az storage blob upload --auth-mode login --account-name "$ACCOUNT" -c tfstate -n "probe/plan-$RUN.txt" -f probe.txt -o none && echo "PASS: writes its state container"
+  apply:
+    needs: plan
+    runs-on: ubuntu-latest
+    environment: production-apply
+    permissions: { contents: read, id-token: write }
+    steps:
+      - uses: azure/login@7184910d9eb2b1c5e48f7073824a90609bb9b6d6 # v2
+        with: { client-id: "${{ vars.AZURE_CLIENT_ID }}", tenant-id: "${{ vars.AZURE_TENANT_ID }}", subscription-id: "${{ vars.AZURE_SUBSCRIPTION_ID }}" }
+      - name: Apply identity can change only the application group
+        env: { APP: "${{ vars.APP_GROUP }}", OUTSIDE: "${{ vars.OUTSIDE_GROUP }}", ACCOUNT: "${{ vars.STATE_ACCOUNT }}", RUN: "${{ github.run_id }}", SUB: "${{ vars.AZURE_SUBSCRIPTION_ID }}" }
+        run: |
+          set -u
+          denied() { out=$("${@:2}" 2>&1) && { echo "UNEXPECTED SUCCESS: $1"; exit 1; }; echo "$out" | grep -q "$1" || { echo "Not the expected denial ($1): $out"; exit 1; }; echo "DENIED as expected ($1)"; }
+          az identity create -g "$APP" -n "apply-probe-$RUN" -l uksouth -o none && echo "PASS: creates a resource in the application group"
+          az identity delete -g "$APP" -n "apply-probe-$RUN" && echo "PASS: removes its own probe resource"
+          denied AuthorizationFailed az identity create -g "$OUTSIDE" -n "apply-probe-$RUN" -l uksouth
+          denied AuthorizationFailed az role assignment create --assignee-object-id 00000000-0000-0000-0000-000000000001 --assignee-principal-type ServicePrincipal --role Reader --scope "/subscriptions/$SUB/resourceGroups/$APP"
+          echo "apply-$RUN" > probe.txt
+          az storage blob upload --auth-mode login --account-name "$ACCOUNT" -c tfstate -n "probe/apply-$RUN.txt" -f probe.txt -o none && echo "PASS: writes its state container"
+  deploy:
+    needs: apply
+    runs-on: ubuntu-latest
+    environment: production-deploy
+    permissions: { contents: read, id-token: write }
+    steps:
+      - uses: azure/login@7184910d9eb2b1c5e48f7073824a90609bb9b6d6 # v2
+        with: { client-id: "${{ vars.AZURE_CLIENT_ID }}", tenant-id: "${{ vars.AZURE_TENANT_ID }}", subscription-id: "${{ vars.AZURE_SUBSCRIPTION_ID }}" }
+      - name: Deploy identity has website rights only and no state access
+        env: { APP: "${{ vars.APP_GROUP }}", OUTSIDE: "${{ vars.OUTSIDE_GROUP }}", ACCOUNT: "${{ vars.STATE_ACCOUNT }}", RUN: "${{ github.run_id }}" }
+        run: |
+          set -u
+          denied() { out=$("${@:2}" 2>&1) && { echo "UNEXPECTED SUCCESS: $1"; exit 1; }; echo "$out" | grep -q "$1" || { echo "Not the expected denial ($1): $out"; exit 1; }; echo "DENIED as expected ($1)"; }
+          az group show -n "$APP" -o none && echo "PASS: reads the application group"
+          denied AuthorizationFailed az identity create -g "$APP" -n "deploy-probe-$RUN" -l uksouth
+          denied AuthorizationFailed az group show -n "$OUTSIDE"
+          denied AuthorizationPermissionMismatch az storage blob list --auth-mode login --account-name "$ACCOUNT" -c tfstate
+  unprotected:
+    runs-on: ubuntu-latest
+    permissions: { contents: read, id-token: write }
+    steps:
+      - name: Tokens from outside the protected environments are refused by every identity
+        env: { TENANT: "${{ vars.AZURE_TENANT_ID }}", CLIENTS: "${{ vars.ALL_CLIENT_IDS }}" }
+        run: |
+          set -u
+          [ -n "$CLIENTS" ] || { echo "ALL_CLIENT_IDS is not set"; exit 1; }
+          token=$(curl -fsS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=api://AzureADTokenExchange" | jq -r .value)
+          echo "::add-mask::$token"
+          for client in ${CLIENTS//,/ }; do
+            out=$(curl -sS -X POST "https://login.microsoftonline.com/$TENANT/oauth2/v2.0/token" -d client_id="$client" \
+              -d scope=https://management.azure.com/.default -d grant_type=client_credentials \
+              -d client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer --data-urlencode client_assertion="$token")
+            echo "$out" | grep -q '"access_token"' && { echo "UNEXPECTED: $client accepted a token without its environment"; exit 1; }
+            echo "$out" | grep -qE 'AADSTS70021|AADSTS700213' || { echo "Not a federation denial for $client: $(echo "$out" | jq -r .error_description | head -c 200)"; exit 1; }
+            echo "DENIED as expected for $client (no matching federated subject)"
+          done
