@@ -65,7 +65,8 @@ jobs:
           az group show -n "$APP" -o none && echo "PASS: reads the application group"
           denied AuthorizationFailed az identity create -g "$APP" -n "deploy-probe-$RUN" -l uksouth
           denied AuthorizationFailed az group show -n "$OUTSIDE"
-          denied AuthorizationPermissionMismatch az storage blob list --auth-mode login --account-name "$ACCOUNT" -c tfstate
+          # Call the Blob API directly: az storage commands replace the service's error code with a generic message.
+          denied AuthorizationPermissionMismatch az rest --method get --resource https://storage.azure.com/             --url "https://$ACCOUNT.blob.core.windows.net/tfstate?restype=container&comp=list" --headers x-ms-version=2023-11-03
   unprotected:
     runs-on: ubuntu-latest
     permissions: { contents: read, id-token: write }
